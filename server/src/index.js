@@ -12,6 +12,8 @@ const {
   replayTimeline,
   resolveConflicts,
   checkMigration,
+  diagnoseLog,
+  buildLogSample,
 } = require('./engine');
 
 const app = express();
@@ -190,6 +192,35 @@ app.get('/api/migration-check', (req, res, next) => {
       res.setHeader('Content-Disposition', 'attachment; filename="migration-check.json"');
     }
     res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---- 输入日志诊断（只读：多上下文按键日志分段回放，复用时序回放规则，绝不写回数据文件） ----
+// POST body:
+//   { timeoutMs?: 800,
+//     events: [{ contextId: "ctx-code", key: "g", timeMs: 0, timeoutMs?: 800 }, ...] }
+// 校验失败返回 400 且 details.eventIndex 给出出错事件下标（从 0 开始），不生成部分报告。
+app.post(
+  '/api/log-diagnosis',
+  wrap((req, res) => {
+    const result = diagnoseLog(store.snapshot(), req.body || {});
+    if (req.query.download !== undefined) {
+      res.setHeader('Content-Disposition', 'attachment; filename="log-diagnosis.json"');
+    }
+    res.json(result);
+  }),
+);
+
+// ---- 示例日志（按当前数据生成，保证合法且覆盖 触发/超时/未命中/上下文切换 场景） ----
+app.get('/api/log-diagnosis/sample', (req, res, next) => {
+  try {
+    const sample = buildLogSample(store.snapshot());
+    if (req.query.download !== undefined) {
+      res.setHeader('Content-Disposition', 'attachment; filename="log-sample.json"');
+    }
+    res.json(sample);
   } catch (err) {
     next(err);
   }

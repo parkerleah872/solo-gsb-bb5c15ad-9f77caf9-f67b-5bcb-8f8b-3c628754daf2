@@ -8,6 +8,7 @@ import RegressionSuite from './components/RegressionSuite';
 import Sandbox from './components/Sandbox';
 import ConflictResolver from './components/ConflictResolver';
 import MigrationCheck from './components/MigrationCheck';
+import LogDiagnosis from './components/LogDiagnosis';
 
 export default function App() {
   const [state, setState] = useState({ contexts: [], commands: [] });
@@ -15,7 +16,7 @@ export default function App() {
   const [review, setReview] = useState(null);
   const [globalError, setGlobalError] = useState('');
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState('review'); // review | migration | regression | sandbox
+  const [view, setView] = useState('review'); // review | migration | regression | sandbox | log
 
   const refresh = useCallback(async () => {
     const s = await api.getState();
@@ -142,6 +143,12 @@ export default function App() {
           >
             🛠 变更沙盒
           </button>
+          <button
+            className={view === 'log' ? 'tab active' : 'tab'}
+            onClick={() => setView('log')}
+          >
+            📄 日志诊断
+          </button>
         </nav>
       </header>
 
@@ -150,6 +157,10 @@ export default function App() {
       {view === 'sandbox' ? (
         <div className="regression-layout">
           <Sandbox state={state} onRefresh={refresh} />
+        </div>
+      ) : view === 'log' ? (
+        <div className="regression-layout">
+          <LogDiagnosis />
         </div>
       ) : view === 'regression' ? (
         <div className="regression-layout">

@@ -15,6 +15,8 @@ const {
   mapPressToken,
   mapSequenceTokens,
   checkMigration,
+  diagnoseLog,
+  buildLogSample,
 } = require('../src/engine');
 
 let passed = 0;
@@ -1152,6 +1154,194 @@ test('迁移检查：纯只读且结果与数据顺序无关', () => {
   const r2 = checkMigration(shuffled, { direction: 'ctrl-to-meta' });
   const strip = (r) => ({ stats: r.stats, conflicts: r.conflicts, mappedCommands: r.mappedCommands });
   assert.deepEqual(strip(r1), strip(r2));
+});
+
+// ---------- 输入日志诊断 ----------
+const logState = {
+  contexts: [
+    { id: 'root', parentId: null, name: 'Root' },
+    { id: 'editor', parentId: 'root', name: 'Editor' },
+    { id: 'term', parentId: 'root', name: 'Term' },
+  ],
+  commands: [
+    { id: 'e-g', contextId: 'editor', name: 'ed-g', sequenceTokens: ['g'], sequenceLabel: 'G', description: '' },
+    { id: 'e-gd', contextId: 'editor', name: 'ed-gd', sequenceTokens: ['g', 'd'], sequenceLabel: 'G D', description: '' },
+    { id: 't-d', contextId: 'term', name: 'term-d', sequenceTokens: ['d'], sequenceLabel: 'D', description: '' },
+    { id: 't-x1', contextId: 'term', name: 'term-x1', sequenceTokens: ['x'], sequenceLabel: 'X', description: '' },
+    { id: 't-x2', contextId: 'term', name: 'term-x2', sequenceTokens: ['x'], sequenceLabel: 'X', description: '' },
+  ],
+};
+
+test('日志诊断：按连续相同上下文切段，每段首键为时间原点，切换上下文结束上一段待定状态', () => {
+  const r = diagnoseLog(logState, {
+    events: [
+      { contextId: 'editor', key: 'g', timeMs: 1000 }, // #0 editor：G 待定
+      { contextId: 'term', key: 'd', timeMs: 1500 }, //   #1 term：D 独立触发（不接 editor 的 G 前缀）
+      { contextId: 'term', key: 'x', timeMs: 1700 }, //   #2 term：X 同层重复双触发
+      { contextId: 'editor', key: 'g', timeMs: 3000 }, // #3 editor：G 待定
+      { contextId: 'editor', key: 'd', timeMs: 3200 }, // #4 editor：触发 G D
+    ],
+  });
+  assert.equal(r.format, 'shortcut-log-diagnosis-v1');
+  assert.equal(r.stats.eventCount, 5);
+  assert.equal(r.stats.segmentCount, 3);
+  assert.equal(r.stats.contextCount, 2);
+  assert.equal(r.stats.durationMs, 2200); // 3200 - 1000
+
+  // 段 0：editor 单键 G 待定，段尾（切换上下文）按超时结算触发短序列
+  const seg0 = r.segments[0];
+  assert.equal(seg0.contextId, 'editor');
+  assert.equal(seg0.startEventIndex, 0);
+  assert.deepEqual([seg0.startMs, seg0.endMs], [1000, 1000]);
+  assert.equal(seg0.replay.events[0].timeMs, 0); // 段首键为时间原点
+  assert.equal(seg0.replay.events[0].status, 'pending');
+  const seg0Timeout = seg0.replay.events[1];
+  assert.equal(seg0Timeout.type, 'timeout');
+  assert.equal(seg0Timeout.timeMs, 800); // 段内原点 + 默认阈值
+  assert.deepEqual(seg0Timeout.triggered.map((c) => c.commandId), ['e-g']);
+
+  // 段 1：term 的 D 是全新起算（上一段 G 前缀不串入），X 同层重复双方同时触发
+  const seg1 = r.segments[1];
+  assert.equal(seg1.contextId, 'term');
+  assert.deepEqual([seg1.startMs, seg1.endMs], [1500, 1700]);
+  assert.equal(seg1.replay.events[0].status, 'triggered');
+  assert.deepEqual(seg1.replay.events[0].triggered.map((c) => c.commandId), ['t-d']);
+  assert.equal(seg1.replay.events[0].restartFrom, false); // 不是“重新起算”，而是新段全新开始
+  assert.equal(seg1.replay.events[1].timeMs, 200); // 1700 - 1500
+  assert.deepEqual(
+    seg1.replay.events[1].triggered.map((c) => c.commandId).sort(),
+    ['t-x1', 't-x2'],
+  );
+
+  // 段 2：回到 editor，G D 在阈值内续键触发
+  const seg2 = r.segments[2];
+  assert.equal(seg2.contextId, 'editor');
+  assert.equal(seg2.startEventIndex, 3);
+  assert.equal(seg2.replay.events[1].status, 'triggered');
+  assert.deepEqual(seg2.replay.events[1].triggered.map((c) => c.commandId), ['e-gd']);
+
+  // 每个 press 事件都标注了原始日志下标
+  assert.equal(seg0.replay.events[0].eventIndex, 0);
+  assert.equal(seg1.replay.events[0].eventIndex, 1);
+  assert.equal(seg1.replay.events[1].eventIndex, 2);
+  assert.equal(seg2.replay.events[1].eventIndex, 4);
+
+  // 汇总：各命令触发次数
+  assert.equal(r.stats.triggeredCommandCount, 5); // e-g + t-d + t-x1 + t-x2 + e-gd
+  assert.equal(r.stats.firedEventCount, 4);
+  assert.equal(r.stats.timeoutCount, 1);
+  assert.equal(r.stats.missCount, 0);
+  const triggers = Object.fromEntries(r.summary.commandTriggers.map((c) => [c.commandId, c.count]));
+  assert.deepEqual(triggers, { 'e-g': 1, 'e-gd': 1, 't-d': 1, 't-x1': 1, 't-x2': 1 });
+  assert.deepEqual(r.summary.contextMisses, []);
+});
+
+test('日志诊断：未命中按上下文汇总次数', () => {
+  const r = diagnoseLog(logState, {
+    events: [
+      { contextId: 'term', key: 'z', timeMs: 0 },
+      { contextId: 'term', key: 'z', timeMs: 100 },
+      { contextId: 'editor', key: 'q', timeMs: 200 },
+    ],
+  });
+  assert.equal(r.stats.missCount, 3);
+  assert.equal(r.stats.segmentCount, 2);
+  assert.deepEqual(r.summary.contextMisses, [
+    { contextId: 'term', contextPath: 'Root / Term', count: 2 },
+    { contextId: 'editor', contextPath: 'Root / Editor', count: 1 },
+  ]);
+  assert.equal(r.stats.triggeredCommandCount, 0);
+});
+
+test('日志诊断：全局与逐事件 timeoutMs 阈值', () => {
+  const r = diagnoseLog(logState, {
+    timeoutMs: 500,
+    events: [{ contextId: 'editor', key: 'g', timeMs: 0, timeoutMs: 300 }],
+  });
+  assert.equal(r.timeoutMs, 500);
+  const timeout = r.segments[0].replay.events[1];
+  assert.equal(timeout.type, 'timeout');
+  assert.equal(timeout.timeMs, 300); // 逐事件覆盖生效
+});
+
+test('日志诊断：非法输入返回事件位置且不生成部分报告', () => {
+  const expectLogError = (input, eventIndex, pattern) => {
+    assert.throws(
+      () => diagnoseLog(logState, input),
+      (err) => {
+        assert.equal(err.status, 400);
+        if (eventIndex !== null) assert.equal(err.details?.eventIndex, eventIndex);
+        else assert.equal(err.details, undefined);
+        assert.match(err.message, pattern);
+        return true;
+      },
+    );
+  };
+  expectLogError({ events: [{ contextId: 'ghost', key: 'g', timeMs: 0 }] }, 0, /上下文不存在/);
+  expectLogError({ events: [{ contextId: 'term', key: 'ctrl+', timeMs: 0 }] }, 0, /按键无效/);
+  expectLogError({ events: [{ contextId: 'term', key: '', timeMs: 0 }] }, 0, /按键无效/);
+  expectLogError({ events: [{ contextId: 'term', key: 'd', timeMs: -1 }] }, 0, /timeMs/);
+  expectLogError(
+    {
+      events: [
+        { contextId: 'term', key: 'd', timeMs: 10 },
+        { contextId: 'term', key: 'x', timeMs: 5 },
+      ],
+    },
+    1,
+    /单调不减/,
+  );
+  expectLogError({ events: [{ contextId: 'term', key: 'd', timeMs: 0, timeoutMs: -2 }] }, 0, /timeoutMs/);
+  expectLogError({ events: ['not-an-object'] }, 0, /事件对象/);
+  expectLogError({ events: [{ key: 'd', timeMs: 0 }] }, 0, /contextId/);
+  expectLogError({ events: [] }, null, /至少需要一个/);
+  expectLogError({}, null, /events/);
+  // 出错位置精确指向非法事件；校验整体失败，不会产出任何分段报告
+  expectLogError(
+    {
+      events: [
+        { contextId: 'term', key: 'd', timeMs: 0 },
+        { contextId: 'ghost', key: 'd', timeMs: 1 },
+      ],
+    },
+    1,
+    /上下文不存在/,
+  );
+});
+
+test('日志诊断：纯只读，不修改传入状态', () => {
+  const before = JSON.stringify(logState);
+  diagnoseLog(logState, {
+    events: [
+      { contextId: 'editor', key: 'g', timeMs: 0 },
+      { contextId: 'term', key: 'd', timeMs: 100 },
+    ],
+  });
+  assert.equal(JSON.stringify(logState), before);
+});
+
+test('日志诊断：示例日志对当前数据合法，覆盖 触发/超时/未命中/多段切换', () => {
+  const sampleState = {
+    contexts: [
+      { id: 'r', parentId: null, name: 'R' },
+      { id: 'w', parentId: 'r', name: 'W' },
+    ],
+    commands: [
+      { id: 's1', contextId: 'r', name: 'g-cmd', sequenceTokens: ['g'], sequenceLabel: 'G', description: '' },
+      { id: 's2', contextId: 'r', name: 'gd-cmd', sequenceTokens: ['g', 'd'], sequenceLabel: 'G D', description: '' },
+      { id: 's3', contextId: 'w', name: 'k-cmd', sequenceTokens: ['k'], sequenceLabel: 'K', description: '' },
+    ],
+  };
+  const sample = buildLogSample(sampleState);
+  assert.ok(Array.isArray(sample.events) && sample.events.length >= 4);
+  // 示例可直接作为诊断输入
+  const r = diagnoseLog(sampleState, sample);
+  assert.equal(r.stats.segmentCount, 2);
+  assert.equal(r.stats.timeoutCount, 1); // 第一段末尾的待定短序列超时结算
+  assert.equal(r.stats.missCount, 1); // 第二段的未命中演示
+  assert.equal(r.stats.triggeredCommandCount, 3); // G D（续键触发）+ G（超时）+ K
+  const names = r.summary.commandTriggers.map((c) => c.commandId).sort();
+  assert.deepEqual(names, ['s1', 's2', 's3']);
 });
 
 console.log(`\n引擎测试全部通过：${passed} 项`);

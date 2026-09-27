@@ -38,4 +38,6 @@ export const api = {
     request(`/conflicts/resolve/${contextId}`, { method: 'POST', body: JSON.stringify(body) }),
   migrationCheck: (direction) =>
     request(`/migration-check?direction=${encodeURIComponent(direction || 'ctrl-to-meta')}`),
+  logDiagnosis: (body) => request('/log-diagnosis', { method: 'POST', body: JSON.stringify(body) }),
+  logDiagnosisSample: () => request('/log-diagnosis/sample'),
 };
