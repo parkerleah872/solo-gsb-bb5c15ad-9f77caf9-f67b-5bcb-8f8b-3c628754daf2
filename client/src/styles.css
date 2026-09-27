@@ -1436,3 +1436,74 @@ select:focus {
 .sandbox-conflict-block {
   margin: 8px 0;
 }
+
+/* ---- 输入日志诊断 ---- */
+.log-input-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.log-input-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.log-textarea {
+  width: 100%;
+  min-height: 150px;
+  resize: vertical;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  padding: 10px 12px;
+  box-sizing: border-box;
+}
+.log-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.log-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.log-summary-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 14px 12px;
+}
+.log-summary-panel h3 {
+  margin: 2px 0 8px;
+  font-size: 13.5px;
+}
+.log-summary-panel .num {
+  text-align: right;
+  font-family: ui-monospace, monospace;
+}
+.log-seg-chips {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: auto;
+}
+.conflict-chip.ok {
+  color: var(--ok);
+  border-color: rgba(74, 222, 128, 0.5);
+  background: rgba(74, 222, 128, 0.1);
+}
+.conflict-chip.warn {
+  color: var(--warn);
+  border-color: rgba(245, 181, 68, 0.5);
+  background: rgba(245, 181, 68, 0.1);
+}

@@ -10,6 +10,8 @@ const {
   generateRegressionSuite,
   previewSandbox,
   replayTimeline,
+  diagnoseInputLog,
+  buildInputLogSample,
   resolveConflicts,
   checkMigration,
 } = require('./engine');
@@ -117,6 +119,38 @@ app.post(
     res.json(result);
   }),
 );
+
+// ---- 输入日志诊断（只读：跨上下文按键日志按连续相同上下文切段，逐段复用时序回放规则） ----
+// POST body:
+//   { timeoutMs?: 800,
+//     events: [{ contextId: "ctx-code", key: "g", timeMs: 0, timeoutMs?: 800 }, ...] }
+// 校验先行（上下文存在 / 按键格式 / 时间非递减），任一事件非法即整体 400 并给出事件位置；
+// 每段以首键为时间原点独立回放，切换上下文时段末待定按超时结算，段间不共享缓冲。
+app.post(
+  '/api/log-diagnose',
+  wrap((req, res) => {
+    const result = diagnoseInputLog(store.snapshot(), req.body || {}, {
+      timeoutMs: (req.body || {}).timeoutMs,
+    });
+    if (req.query.download !== undefined) {
+      res.setHeader('Content-Disposition', 'attachment; filename="input-log-report.json"');
+    }
+    res.json(result);
+  }),
+);
+
+// ---- 示例输入日志（基于当前数据动态生成，保证合法，可直接用于诊断） ----
+app.get('/api/log-diagnose/sample', (req, res, next) => {
+  try {
+    const sample = buildInputLogSample(store.snapshot());
+    if (req.query.download !== undefined) {
+      res.setHeader('Content-Disposition', 'attachment; filename="input-log-sample.json"');
+    }
+    res.json(sample);
+  } catch (err) {
+    next(err);
+  }
+});
 
 // ---- 回归套件生成（叶子候选 + 精确集合覆盖，只读复用现有生效规则） ----
 app.get('/api/regression-suite', (req, res, next) => {

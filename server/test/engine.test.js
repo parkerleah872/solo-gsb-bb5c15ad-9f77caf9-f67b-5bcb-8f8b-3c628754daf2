@@ -8,6 +8,8 @@ const {
   conflictGoalId,
   previewSandbox,
   replayTimeline,
+  diagnoseInputLog,
+  buildInputLogSample,
   resolveConflicts,
   stateFingerprint,
   inspectDraftOps,
@@ -1152,6 +1154,173 @@ test('迁移检查：纯只读且结果与数据顺序无关', () => {
   const r2 = checkMigration(shuffled, { direction: 'ctrl-to-meta' });
   const strip = (r) => ({ stats: r.stats, conflicts: r.conflicts, mappedCommands: r.mappedCommands });
   assert.deepEqual(strip(r1), strip(r2));
+});
+
+// ---------- 输入日志诊断 ----------
+const logState = {
+  contexts: [
+    { id: 'la', parentId: null, name: 'LogA' },
+    { id: 'lb', parentId: null, name: 'LogB' },
+  ],
+  commands: [
+    { id: 'la-g', contextId: 'la', name: 'A-go', sequenceTokens: ['g'], sequenceLabel: 'G', description: '' },
+    { id: 'la-gd', contextId: 'la', name: 'A-gd', sequenceTokens: ['g', 'd'], sequenceLabel: 'G D', description: '' },
+    { id: 'lb-x', contextId: 'lb', name: 'B-x', sequenceTokens: ['x'], sequenceLabel: 'X', description: '' },
+    { id: 'lb-xk', contextId: 'lb', name: 'B-xk', sequenceTokens: ['x', 'k'], sequenceLabel: 'X K', description: '' },
+  ],
+};
+const E = (contextId, key, timeMs, timeoutMs) =>
+  timeoutMs === undefined ? { contextId, key, timeMs } : { contextId, key, timeMs, timeoutMs };
+
+test('日志诊断：按连续相同上下文切段，每段以首键为时间原点', () => {
+  const r = diagnoseInputLog(logState, {
+    events: [
+      E('la', 'g', 1000),
+      E('la', 'd', 1200), // 阈值内续键 -> 触发 A-gd
+      E('lb', 'x', 5000), // 切上下文：新段从 5000 重新起算
+      E('la', 'g', 9000), // 再次切回：又一段
+    ],
+  });
+  assert.equal(r.format, 'shortcut-input-log-report-v1');
+  assert.equal(r.eventCount, 4);
+  assert.equal(r.segmentCount, 3);
+  // 段边界与原始事件位置（1-based）
+  assert.deepEqual(
+    r.segments.map((s) => [s.contextId, s.eventFrom, s.eventTo, s.startMs]),
+    [
+      ['la', 1, 2, 1000],
+      ['lb', 3, 3, 5000],
+      ['la', 4, 4, 9000],
+    ],
+  );
+  // 段内时间以首键为原点；logTimeMs 还原原始时间轴
+  assert.equal(r.segments[0].events[0].timeMs, 0);
+  assert.equal(r.segments[0].events[0].logTimeMs, 1000);
+  assert.equal(r.segments[0].events[1].timeMs, 200);
+  assert.equal(r.segments[0].events[1].logTimeMs, 1200);
+  assert.equal(r.segments[1].events[0].timeMs, 0);
+  assert.equal(r.segments[1].events[0].logTimeMs, 5000);
+  // 段一：g@0 pending，d@200 阈值内续键 -> 触发长序列 A-gd（短序列不触发）
+  assert.equal(r.segments[0].events[0].status, 'pending');
+  assert.equal(r.segments[0].events[1].status, 'triggered');
+  assert.deepEqual(r.segments[0].events[1].triggered.map((c) => c.commandId), ['la-gd']);
+});
+
+test('日志诊断：切换上下文结束上一段待定状态，前缀不接到下一段', () => {
+  // la 的 g 进入待定后立刻切到 lb：段一末尾按超时结算触发 la-g；
+  // lb 的 x 是全新段的首键（不受 la 缓冲影响），随后 k 在阈值内补全 X K
+  const r = diagnoseInputLog(logState, {
+    events: [E('la', 'g', 0), E('lb', 'x', 300), E('lb', 'k', 500)],
+  });
+  assert.equal(r.segmentCount, 2);
+  const seg1 = r.segments[0];
+  assert.equal(seg1.events[0].status, 'pending');
+  assert.equal(seg1.events[1].type, 'timeout'); // 段末待定按超时结算
+  assert.equal(seg1.events[1].timeMs, 800); // 段内截止时刻
+  assert.equal(seg1.events[1].logTimeMs, 800);
+  assert.deepEqual(seg1.events[1].triggered.map((c) => c.commandId), ['la-g']);
+  // 段二：x@0（段内原点）pending，k@200 触发 X K；la 的 G 前缀没有串入
+  const seg2 = r.segments[1];
+  assert.equal(seg2.events[0].status, 'pending');
+  assert.equal(seg2.events[0].restartFrom, false); // 段首键从空缓冲起算：未接上一上下文的前缀
+  assert.deepEqual(seg2.events[0].held.map((c) => c.commandId), ['lb-x']);
+  assert.equal(seg2.events[1].status, 'triggered');
+  assert.deepEqual(seg2.events[1].triggered.map((c) => c.commandId), ['lb-xk']);
+  // 段内全部事件只涉及本上下文命令
+  const seg2CmdIds = seg2.events.flatMap((e) => e.triggered.map((c) => c.commandId));
+  assert.ok(seg2CmdIds.every((id) => id.startsWith('lb-')));
+});
+
+test('日志诊断：未命中重新起算与汇总计数（各命令触发次数 / 各上下文未命中次数）', () => {
+  const r = diagnoseInputLog(logState, {
+    events: [
+      E('la', 'z', 0), // la 无 z：未命中
+      E('la', 'g', 100), // 重新起算：pending
+      E('la', 'd', 200), // 触发 A-gd
+      E('lb', 'z', 3000), // lb 无 z：未命中
+      E('lb', 'z', 3200), // 再次未命中
+      E('lb', 'x', 3500), // pending
+      // 段末超时触发 lb-x
+    ],
+  });
+  assert.equal(r.stats.noMatchEventCount, 3);
+  assert.equal(r.stats.timeoutEventCount, 1);
+  // 各命令触发次数
+  const triggers = Object.fromEntries(r.summary.commandTriggers.map((c) => [c.commandId, c.count]));
+  assert.deepEqual(triggers, { 'la-gd': 1, 'lb-x': 1 });
+  assert.equal(r.stats.triggeredCommandCount, 2);
+  // 各上下文未命中次数
+  const misses = Object.fromEntries(r.summary.contextNoMatch.map((c) => [c.contextId, c.count]));
+  assert.deepEqual(misses, { la: 1, lb: 2 });
+  // 未命中事件带重新起算标记
+  const laSeg = r.segments[0];
+  assert.equal(laSeg.events[0].status, 'no-match');
+  assert.equal(laSeg.events[1].restartFrom, true);
+});
+
+test('日志诊断：逐事件 timeoutMs 覆盖与全局阈值校验', () => {
+  const r = diagnoseInputLog(logState, { events: [E('la', 'g', 0, 300)] }, { timeoutMs: 800 });
+  assert.equal(r.timeoutMs, 800);
+  assert.equal(r.segments[0].events[1].type, 'timeout');
+  assert.equal(r.segments[0].events[1].timeMs, 300); // 该键自身阈值
+  assert.throws(() => diagnoseInputLog(logState, { events: [E('la', 'g', 0)] }, { timeoutMs: -1 }), /超时阈值/);
+});
+
+test('日志诊断：非法输入带事件位置整体拒绝，不生成部分报告', () => {
+  // 上下文不存在
+  assert.throws(
+    () => diagnoseInputLog(logState, { events: [E('la', 'g', 0), E('nope', 'g', 1)] }),
+    (err) => {
+      assert.equal(err.status, 400);
+      assert.match(err.message, /第 2 个事件.*上下文不存在/);
+      assert.equal(err.details.eventSeq, 2);
+      assert.equal(err.details.eventIndex, 1);
+      return true;
+    },
+  );
+  // 时间递减
+  assert.throws(
+    () => diagnoseInputLog(logState, { events: [E('la', 'g', 10), E('la', 'd', 5)] }),
+    /第 2 个事件.*非递减/,
+  );
+  // 按键格式非法
+  assert.throws(
+    () => diagnoseInputLog(logState, { events: [E('la', 'ctrl+alt', 0)] }),
+    /第 1 个事件.*按键无效/,
+  );
+  // 缺少 events / 空日志 / 缺 contextId / 负时间 / 非法阈值
+  assert.throws(() => diagnoseInputLog(logState, {}), /events/);
+  assert.throws(() => diagnoseInputLog(logState, { events: [] }), /至少需要一个/);
+  assert.throws(() => diagnoseInputLog(logState, { events: [{ key: 'g', timeMs: 0 }] }), /contextId/);
+  assert.throws(() => diagnoseInputLog(logState, { events: [E('la', 'g', -1)] }), /timeMs/);
+  assert.throws(() => diagnoseInputLog(logState, { events: [E('la', 'g', 0, -3)] }), /timeoutMs/);
+});
+
+test('日志诊断：key/token/press 字段别名与大小写规范化', () => {
+  const r = diagnoseInputLog(logState, {
+    events: [
+      { contextId: 'la', key: 'G', timeMs: 0 },
+      { contextId: 'la', token: 'D', timeMs: 100 },
+      { contextId: 'lb', press: 'x', timeMs: 200 },
+    ],
+  });
+  assert.equal(r.segmentCount, 2);
+  assert.equal(r.segments[0].events[1].status, 'triggered'); // G D 触发
+});
+
+test('日志诊断：示例日志基于当前数据生成且能通过诊断', () => {
+  const sample = buildInputLogSample(logState);
+  assert.equal(sample.format, 'shortcut-input-log-v1');
+  assert.ok(sample.events.length >= 3);
+  for (let i = 1; i < sample.events.length; i++) {
+    assert.ok(sample.events[i].timeMs >= sample.events[i - 1].timeMs);
+  }
+  const r = diagnoseInputLog(logState, sample);
+  assert.ok(r.segmentCount >= 2); // 前缀对上下文 + 另一上下文
+  assert.ok(r.stats.triggeredCommandCount >= 2);
+  // 演示数据（含前缀链）下应出现段末超时结算与未命中
+  assert.ok(r.stats.timeoutEventCount >= 1);
+  assert.ok(r.stats.noMatchEventCount >= 1);
 });
 
 console.log(`\n引擎测试全部通过：${passed} 项`);

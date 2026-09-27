@@ -666,6 +666,270 @@ function replayTimeline(state, contextId, input, options = {}) {
   };
 }
 
+/* ================= 输入日志诊断（跨上下文按键日志分段回放） ================= */
+
+const badLog = (message, eventIndex) => {
+  const err = Object.assign(new Error(message), { status: 400 });
+  if (eventIndex !== undefined) {
+    err.details = { eventIndex, eventSeq: eventIndex + 1 };
+  }
+  return err;
+};
+
+/**
+ * 输入日志诊断：把一份「按时间排序、带上下文 ID 的按键事件日志」按连续相同
+ * 上下文切成若干段，每段以首键为时间原点独立复用 replayTimeline 的时序回放
+ * 规则（待定 / 超时 / 重新起算），最后汇总各命令触发次数与各上下文未命中次数。
+ *
+ * 规则：
+ * - 切段：连续相同 contextId 的事件为一段；切换上下文即结束上一段——段末未决的
+ *   待定短序列按超时在该段内结算（replayTimeline 末尾自动补发 timeout 事件），
+ *   缓冲与待定状态绝不带入下一段（不会把前一上下文的前缀接到下一段）；
+ * - 时间原点：每段以首键 timeMs 为 0 回放；报告中的事件同时给出段内相对时刻
+ *   （timeMs）与原始日志时刻（logTimeMs = 段首 timeMs + timeMs）；
+ * - 校验先行：全部事件（上下文存在、按键格式、时间非递减、阈值合法）校验通过后
+ *   才开始回放；任一事件非法即整体拒绝（400，错误信息带事件位置），不生成部分报告。
+ *
+ * input:
+ *   { timeoutMs?: 800,
+ *     events: [{ contextId, key | token | press, timeMs, timeoutMs? }, ...] }
+ */
+function diagnoseInputLog(state, input, options = {}) {
+  const globalTimeout = Number.isFinite(Number(options.timeoutMs))
+    ? Number(options.timeoutMs)
+    : DEFAULT_REPLAY_TIMEOUT_MS;
+  if (!Number.isInteger(globalTimeout) || globalTimeout < 0) {
+    throw badLog('超时阈值必须是非负整数毫秒');
+  }
+
+  const rawEvents = Array.isArray(input?.events) ? input.events : null;
+  if (!rawEvents) throw badLog('日志诊断需要 events（按时间排序的按键事件数组）');
+  if (rawEvents.length === 0) throw badLog('日志至少需要一个按键事件');
+
+  const index = buildIndex(state.contexts);
+
+  // ---- 全量校验：任一事件非法即整体拒绝，绝不生成部分报告 ----
+  const events = [];
+  for (let i = 0; i < rawEvents.length; i++) {
+    const e = rawEvents[i];
+    const at = `第 ${i + 1} 个事件`;
+    if (!e || typeof e !== 'object' || Array.isArray(e)) {
+      throw badLog(`${at}必须是对象（含 contextId / key / timeMs）`, i);
+    }
+    const contextId = typeof e.contextId === 'string' ? e.contextId.trim() : '';
+    if (!contextId) throw badLog(`${at}缺少上下文 ID（contextId）`, i);
+    if (!index.byId.has(contextId)) throw badLog(`${at}的上下文不存在：${contextId}`, i);
+    const canonical = canonicalPress(e.key ?? e.token ?? e.press);
+    if (!canonical.ok) throw badLog(`${at}的按键无效：${canonical.error}`, i);
+    const t = Number(e.timeMs);
+    if (!Number.isFinite(t) || t < 0) throw badLog(`${at}的 timeMs 必须是非负数`, i);
+    let timeoutMs = globalTimeout;
+    if (e.timeoutMs !== undefined && e.timeoutMs !== null) {
+      timeoutMs = Number(e.timeoutMs);
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
+        throw badLog(`${at}的 timeoutMs 必须是非负整数毫秒`, i);
+      }
+    }
+    if (events.length > 0 && t < events[events.length - 1].timeMs) {
+      throw badLog(`${at}的时间早于上一事件，日志必须按时间非递减排序`, i);
+    }
+    events.push({ contextId, token: canonical.token, pretty: canonical.pretty, timeMs: t, timeoutMs });
+  }
+
+  // ---- 按连续相同上下文切段 ----
+  const segments = [];
+  for (const ev of events) {
+    const last = segments[segments.length - 1];
+    if (last && last.contextId === ev.contextId) {
+      last.events.push(ev);
+    } else {
+      segments.push({ contextId: ev.contextId, events: [ev] });
+    }
+  }
+
+  // ---- 逐段独立回放：以段首键为时间原点，段间不共享缓冲与待定状态 ----
+  const commandTriggerCount = new Map(); // commandId -> 汇总条目
+  const contextNoMatchCount = new Map(); // contextId -> 汇总条目
+  const segmentReports = [];
+  const stats = {
+    triggeredCommandCount: 0, // 触发命令总次数（同层重复逐命令累计）
+    firedEventCount: 0, // 产生了触发的事件数（按键触发 + 超时触发）
+    timeoutEventCount: 0,
+    noMatchEventCount: 0,
+  };
+  let eventOffset = 0;
+
+  for (let si = 0; si < segments.length; si++) {
+    const seg = segments[si];
+    const startMs = seg.events[0].timeMs; // 段时间原点：段内首键的日志时刻
+    const replay = replayTimeline(
+      state,
+      seg.contextId,
+      {
+        presses: seg.events.map((ev) => ({
+          token: ev.token,
+          timeMs: ev.timeMs - startMs,
+          timeoutMs: ev.timeoutMs,
+        })),
+      },
+      { timeoutMs: globalTimeout },
+    );
+
+    const eventFrom = eventOffset + 1; // 原始事件位置（1-based，含端点）
+    const eventTo = eventOffset + seg.events.length;
+    eventOffset += seg.events.length;
+
+    const segEvents = replay.events.map((ev) => ({ ...ev, logTimeMs: ev.timeMs + startMs }));
+    const segFired = replay.fired.map((f) => ({ ...f, logAtMs: f.atMs + startMs }));
+
+    for (const ev of segEvents) {
+      if (ev.type === 'timeout') stats.timeoutEventCount++;
+      if (ev.status === 'no-match') {
+        stats.noMatchEventCount++;
+        const entry =
+          contextNoMatchCount.get(seg.contextId) ||
+          { contextId: seg.contextId, contextPath: replay.contextPath, count: 0 };
+        entry.count++;
+        contextNoMatchCount.set(seg.contextId, entry);
+      }
+      for (const cmd of ev.triggered) {
+        stats.triggeredCommandCount++;
+        const entry =
+          commandTriggerCount.get(cmd.commandId) ||
+          {
+            commandId: cmd.commandId,
+            name: cmd.name,
+            sequenceLabel: cmd.sequenceLabel,
+            contextPath: cmd.contextPath,
+            count: 0,
+          };
+        entry.count++;
+        commandTriggerCount.set(cmd.commandId, entry);
+      }
+    }
+    stats.firedEventCount += replay.firedCount;
+
+    segmentReports.push({
+      index: si,
+      contextId: seg.contextId,
+      contextPath: replay.contextPath,
+      startMs,
+      endMs: seg.events[seg.events.length - 1].timeMs,
+      eventFrom,
+      eventTo,
+      pressCount: replay.pressCount,
+      status: replay.status,
+      firedCount: replay.firedCount,
+      timeoutCount: segEvents.filter((e) => e.type === 'timeout').length,
+      noMatchCount: segEvents.filter((e) => e.status === 'no-match').length,
+      durationMs: replay.durationMs,
+      events: segEvents,
+      fired: segFired,
+    });
+  }
+
+  const byCountDesc = (a, b) =>
+    b.count - a.count ||
+    (a.contextPath < b.contextPath ? -1 : a.contextPath > b.contextPath ? 1 : 0) ||
+    ((a.name || a.commandId) < (b.name || b.commandId) ? -1 : 1);
+
+  return {
+    format: 'shortcut-input-log-report-v1',
+    generatedAt: new Date().toISOString(),
+    timeoutMs: globalTimeout,
+    eventCount: events.length,
+    segmentCount: segments.length,
+    durationMs: events[events.length - 1].timeMs,
+    stats,
+    segments: segmentReports,
+    summary: {
+      commandTriggers: [...commandTriggerCount.values()].sort(byCountDesc),
+      contextNoMatch: [...contextNoMatchCount.values()].sort(byCountDesc),
+    },
+  };
+}
+
+/**
+ * 生成一份基于当前数据的示例输入日志（保证合法：上下文存在、按键规范、时间非递减）。
+ * 优先覆盖关键场景：前缀链阈值内续键触发长序列、切换上下文时段末待定按超时结算、
+ * 未命中后重新起算、单键直接触发。数据中没有对应场景时自动退化。
+ */
+function buildInputLogSample(state) {
+  const timeoutMs = DEFAULT_REPLAY_TIMEOUT_MS;
+  const index = buildIndex(state.contexts);
+  const contextIds = [...index.byId.keys()];
+  const sample = { format: 'shortcut-input-log-v1', timeoutMs, events: [] };
+  if (contextIds.length === 0) return sample;
+
+  const effOf = (cid) => computeEffective(state, cid);
+
+  // 1) 找一个“短序列是长序列严格前缀”的上下文（演示待定 / 超时 / 阈值内续键）
+  let pair = null;
+  for (const cid of contextIds) {
+    const groups = effOf(cid).effectiveGroups;
+    for (const short of groups) {
+      const long = groups.find((g) => isPrefix(short.tokens, g.tokens));
+      if (long) {
+        pair = { contextId: cid, short, long };
+        break;
+      }
+    }
+    if (pair) break;
+  }
+
+  // 2) 找一个有单键生效序列的上下文（演示直接触发），优先与前缀对不同上下文
+  let solo = null;
+  for (const preferDifferent of [true, false]) {
+    for (const cid of contextIds) {
+      if (preferDifferent && pair && cid === pair.contextId) continue;
+      const g = effOf(cid).effectiveGroups.find((grp) => grp.tokens.length === 1);
+      if (g) {
+        solo = { contextId: cid, group: g };
+        break;
+      }
+    }
+    if (solo) break;
+  }
+
+  // 未命中键：不在该上下文任何生效序列首键位置的按键
+  const missKeyFor = (cid) => {
+    const firstTokens = new Set(effOf(cid).effectiveGroups.map((g) => g.tokens[0]));
+    const candidates = 'qwertyuiopzxcvbnm0123456789'.split('').concat(['f13', 'f14', 'f15']);
+    return candidates.find((k) => !firstTokens.has(k)) || 'f24';
+  };
+
+  const events = sample.events;
+  let now = 0;
+  const push = (contextId, key, gap) => {
+    now = events.length === 0 ? 0 : now + gap;
+    events.push({ contextId, key, timeMs: now });
+  };
+
+  // 段一：前缀链阈值内续键触发长序列；段末再按短序列进入待定，
+  // 随后切换上下文——该待定按超时在段内结算（演示“切换上下文结束上一段待定”）
+  if (pair) {
+    for (const t of pair.short.tokens) push(pair.contextId, t, 160);
+    for (const t of pair.long.tokens.slice(pair.short.tokens.length)) push(pair.contextId, t, 160);
+    for (const t of pair.short.tokens) push(pair.contextId, t, 700);
+  }
+
+  // 段二（优先另一上下文）：未命中 -> 重新起算 -> 单键直接触发
+  const secondCtx =
+    (solo && (!pair || solo.contextId !== pair.contextId) && solo.contextId) ||
+    contextIds.find((cid) => !pair || cid !== pair.contextId) ||
+    (pair ? pair.contextId : contextIds[0]);
+  push(secondCtx, missKeyFor(secondCtx), 700);
+  const soloGroup =
+    (solo && solo.contextId === secondCtx && solo.group) ||
+    effOf(secondCtx).effectiveGroups.find((g) => g.tokens.length === 1) ||
+    effOf(secondCtx).effectiveGroups[0];
+  if (soloGroup) {
+    for (const t of soloGroup.tokens) push(secondCtx, t, 160);
+  }
+
+  return sample;
+}
+
 /** 收集某上下文子树内的全部叶子上下文（无子上下文） */
 function descendantLeaves(index, contextId) {
   const start = index.byId.get(contextId);
@@ -2150,6 +2414,8 @@ module.exports = {
   evaluateKey,
   replayTimeline,
   DEFAULT_REPLAY_TIMEOUT_MS,
+  diagnoseInputLog,
+  buildInputLogSample,
   descendantLeaves,
   conflictGoalId,
   minimumSetCover,
